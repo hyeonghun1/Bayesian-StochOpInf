@@ -15,9 +15,10 @@ log-posterior or the sampler, not in the method.
 
 Need to swap in our own D, R, Gamma, sigma2 in `build_problem` to run this on real data.
 
-Python run in bash:
-$ python bayesopinf_mcmc_check.py --noise 0.001 --T_train 3 --T_test 8 --n_pf 500
+Data-generating system: --system original | weak_damping | limit_cycle (defined in toy_systems.py).
 
+Usage:
+    python bayesopinf_mcmc_check.py --noise 0.05 --T_train 6 --T_test 12 --K 300 --n_pf 100 --system limit_cycle
 """
 
 import os
@@ -47,38 +48,9 @@ except ImportError:
 CHAIN_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]    # one color per chain
 
 
-# 1. Toy problem: a stable quadratic ROM  dq/dt = c + A q + H (q ⊗ q)_compact
-r = 3
-
-def compact_kron(q):
-    """Non-redundant quadratic terms q_i q_j, i <= j. Works on (r,) or (r, K)."""
-    i, j = np.triu_indices(q.shape[0])
-    return q[i] * q[j]
-
-def true_operators():
-    # linear: damping + rotation
-    A = -np.diag([0.4, 0.8, 1.2]) + np.array([[0, 1.0, 0], [-1.0, 0, 0.5], [0, -0.5, 0]])
-    c = np.array([0.5, 0.0, -0.3])
-    # energy-preserving quadratic: B(q) q with B(q) = sum_k q_k S_k
-    # S: skew-symmetric matrices, so that q^T B(q) q = 0 (energy preserving)
-    S = [np.array([[0, a, b], [-a, 0, e], [-b, -e, 0]])
-         for a, b, e in [(0.6, -0.3, 0.2), (-0.4, 0.5, 0.3), (0.2, 0.1, -0.5)]]
-    # convert B(q) q into compact-Kronecker coefficients
-    iu, ju = np.triu_indices(r)
-    H = np.zeros((r, len(iu)))
-    for m, (i, j) in enumerate(zip(iu, ju)):
-        e_i, e_j = np.eye(r)[i], np.eye(r)[j]
-        # contribution of q_i q_j: S_i e_j + S_j e_i (halved on the diagonal)
-        v = S[i] @ e_j + S[j] @ e_i
-        H[:, m] = v / 2 if i == j else v
-    return c, A, H
-
-def rom_rhs(O):
-    c, A, H = O[:, 0], O[:, 1:1 + r], O[:, 1 + r:]
-    return lambda t, q: c + A @ q + H @ compact_kron(q)
-
-def operators_to_matrix(c, A, H):
-    return np.hstack([c[:, None], A, H])       # O is r x d, row i = o_i
+# 1. Toy problem: the data-generating quadratic ROM  dq/dt = c + A q + H (q ⊗ q)_compact.
+#    The systems (original, weak_damping, limit_cycle) live in toy_systems.py.
+from toy_systems import r, compact_kron, true_operators, rom_rhs, operators_to_matrix, SYSTEMS
 
 from scipy.signal import savgol_filter, savgol_coeffs
 
@@ -106,13 +78,13 @@ def local_poly_smooth(Q, dt, window=None, poly=3, candidates=range(7, 61, 2)):
     return Q_s, dQ, window
 
 def build_problem(noise=0.005, T_train=6.0, K=300, n_traj=5,
-                  deriv="lpr", window=None, poly=3, T_test=None):
+                  deriv="lpr", window=None, poly=3, T_test=None, system="original"):
     """deriv = "fd"  : noisy states + finite differences (original baseline)
        deriv = "lpr" : local-polynomial-smoothed states + derivatives (fair baseline)
        T_test        : if > T_train, also simulate trajectory 0 on (T_train, T_test] with the same dt as
                        held-out test data for time extrapolation. Only [0, T_train] enters D and R,
                        and the training data are identical to T_test=None."""
-    c, A, H = true_operators()
+    c, A, H = true_operators(system)
     O_true = operators_to_matrix(c, A, H)
     t = np.linspace(0, T_train, K)
     dt = t[1] - t[0]
@@ -211,7 +183,6 @@ def sample_row(prob, i, num_warmup=1000, num_samples=2000, num_chains=4, seed=0,
         mcmc.run(key, **data)
         return np.asarray(mcmc.get_samples(group_by_chain=True)["o"])   # chains x draws x d
 
-
     # With diagnostics: run warmup and sampling separately so the warmup draws are kept.
     # extra_fields records, per iteration: divergence flag, number of leapfrog steps (tree size),
     # the current (adapting) step size, and the acceptance probability.
@@ -219,45 +190,27 @@ def sample_row(prob, i, num_warmup=1000, num_samples=2000, num_chains=4, seed=0,
     mcmc.warmup(key, collect_warmup=True, extra_fields=fields, **data)
     warm = np.asarray(mcmc.get_samples(group_by_chain=True)["o"])       # chains x num_warmup x d
     warm_f = {k: np.asarray(v) for k, v in mcmc.get_extra_fields(group_by_chain=True).items()}
-    
     # sampling continues from the adapted state (step size and mass matrix are now frozen)
     mcmc.run(mcmc.post_warmup_state.rng_key, extra_fields=fields, **data)
     samples = np.asarray(mcmc.get_samples(group_by_chain=True)["o"])    # chains x num_samples x d
     samp_f = {k: np.asarray(v) for k, v in mcmc.get_extra_fields(group_by_chain=True).items()}
-    
     return samples, dict(warmup=warm, warmup_fields=warm_f, fields=samp_f)
 
 
 # 3. Comparison metrics
 def gaussian_kl(m0, S0, m1, S1):
-    # Kullback-Leibler divergence from N(m0, S0) to N(m1, S1)
-    # KL( N(m0,S0) || N(m1,S1) ) = \int (p(x) (\log p(x) - \log q(x))) dx >= 0
-    # This is zero only when m0 = m1 and S0 = S1. It is not symmetric: KL(p||q) != KL(q||p) in general.
-    # For two multivariate Gaussians, the closed-form formula is:
-    # KL(N0 || N1) = 0.5 * (tr(S1^{-1} S0) + (m1 - m0)^T S1^{-1} (m1 - m0) - d + log(det(S1) - log(det(S0))
-    #                      ---------------   -----------------------------       -------------------------
-    #                          spread                mean offset                        volume 
-    #                                        (squared distance between means)
-    
+    """KL( N(m0,S0) || N(m1,S1) )."""
     d = len(m0)
     S1_inv = np.linalg.inv(S1)
     dm = m1 - m0
-    _, ld0 = np.linalg.slogdet(S0)      # log det(S0)
-    _, ld1 = np.linalg.slogdet(S1)      # log det(S1)
-    
-    KL = 0.5 * (np.trace(S1_inv @ S0) + dm @ S1_inv @ dm - d + ld1 - ld0)
-    
-    return KL
+    _, ld0 = np.linalg.slogdet(S0)
+    _, ld1 = np.linalg.slogdet(S1)
+    return 0.5 * (np.trace(S1_inv @ S0) + dm @ S1_inv @ dm - d + ld1 - ld0)
 
 
 def compare_row(samples, mu_i, Sigma_i):
-    """Compare the MCMC samples to the analytical posterior N(mu_i, Sigma_i) for one row.
-    Analytical posterior = N(mu_i, Sigma_i)"""
-    # check 1. Did the chains converge, and how much information do they carry?
     ess = np.asarray(effective_sample_size(samples))
     rhat = np.asarray(split_gelman_rubin(samples))
-    
-    # check 2. Is the mean right?
     flat = samples.reshape(-1, samples.shape[-1])
     m_hat = flat.mean(0)
     S_hat = np.cov(flat, rowvar=False)
@@ -266,16 +219,13 @@ def compare_row(samples, mu_i, Sigma_i):
     mcse = np.sqrt(np.diag(Sigma_i) / ess)
     z = (m_hat - mu_i) / mcse
 
-    # check 3. Is the covariance right, in every direction?
     # whitened covariance: L^{-1} S_hat L^{-T} should be ~ I
-    L = np.linalg.cholesky(Sigma_i)                          # Sigma_i = L L^T
-    W = np.linalg.solve(L, np.linalg.solve(L, S_hat).T)      # W = L^{-1} S_hat L^{-T}
+    L = np.linalg.cholesky(Sigma_i)
+    W = np.linalg.solve(L, np.linalg.solve(L, S_hat).T)
     eig = np.linalg.eigvalsh(W)
 
     rel_frob = np.linalg.norm(S_hat - Sigma_i) / np.linalg.norm(Sigma_i)
-    
     kl = gaussian_kl(m_hat, S_hat, mu_i, Sigma_i)
-    
     d = len(mu_i)
     # finite-sample baseline: E[KL] ~ d(d+1)/(4n) for n iid draws. NUTS draws
     # are anti-correlated for means (ESS > N) but not for second moments, so use
@@ -287,46 +237,6 @@ def compare_row(samples, mu_i, Sigma_i):
     return dict(z=z, ess=ess, ess2=ess2, rhat=rhat, eig=eig, rel_frob=rel_frob,
                 kl=kl, kl_expected=kl_expected, m_hat=m_hat, S_hat=S_hat, flat=flat)
 
-
-# 4. Push-forward: ROM prediction bands from MCMC vs. analytical samples
-def pushforward(O_samples, t, q0):
-    out = []
-    for O in O_samples:
-        sol = solve_ivp(rom_rhs(O), (t[0], t[-1]), q0, t_eval=t, rtol=1e-8, atol=1e-10)
-        if sol.success and sol.y.shape[1] == len(t):
-            out.append(sol.y)
-    return np.array(out)                      # n x r x K
-
-
-# 5. Train / test (time-extrapolation) skill of the push-forward ensemble
-def crps_ensemble(Y, y):
-    """CRPS of the ensemble Y (n x ...) at the truth y (...), sorted-ensemble formula."""
-    n = Y.shape[0]          # number of ensemble members
-    X = np.sort(Y, axis=0)
-    i = np.arange(1, n + 1).reshape((-1,) + (1,) * y.ndim)
-    return 2.0 / n**2 * np.sum((X - y) * (n * (y < X) - i + 0.5), axis=0)
-
-
-def score_prediction(Y, t, truth, T_train):
-    """Score rollouts Y (n x r x K) against the noiseless truth (r x K) separately on the
-    training window [0, T_train] and the extrapolation window (T_train, t[-1]].
-
-    rel_err : ||ensemble median - truth||_F / ||truth||_F on the window
-    cov     : fraction of (component, time) points where truth lies in the 95% band
-    width   : mean width of the 95% band
-    crps    : mean CRPS (proper score, same units as q; lower is better)
-    """
-    lo, med, hi = np.percentile(Y, [2.5, 50, 97.5], axis=0)
-    crps = crps_ensemble(Y, truth)
-    out = dict(err_t=np.linalg.norm(med - truth, axis=0) / np.linalg.norm(truth, axis=0))
-    for name, m in [("train", t <= T_train), ("test", t > T_train)]:
-        if m.any():
-            out[name] = dict(
-                rel_err=np.linalg.norm(med[:, m] - truth[:, m]) / np.linalg.norm(truth[:, m]),
-                cov=np.mean((truth[:, m] >= lo[:, m]) & (truth[:, m] <= hi[:, m])),
-                width=np.mean(hi[:, m] - lo[:, m]),
-                crps=crps[:, m].mean())
-    return out
 
 
 # 3b. Mixing diagnostics
@@ -446,16 +356,55 @@ def plot_mixing(i, samples, diag, mu_i, Sigma_i, names, path, n_lag=40, n_early=
     plt.close(fig)
 
 
+# 4. Push-forward: ROM prediction bands from MCMC vs. analytical samples
+def pushforward(O_samples, t, q0):
+    out = []
+    for O in O_samples:
+        sol = solve_ivp(rom_rhs(O), (t[0], t[-1]), q0, t_eval=t, rtol=1e-8, atol=1e-10)
+        if sol.success and sol.y.shape[1] == len(t):
+            out.append(sol.y)
+    return np.array(out)                      # n x r x K
 
 
+# 5. Train / test (time-extrapolation) skill of the push-forward ensemble
+def crps_ensemble(Y, y):
+    """CRPS of the ensemble Y (n x ...) at the truth y (...), sorted-ensemble formula."""
+    n = Y.shape[0]
+    X = np.sort(Y, axis=0)
+    i = np.arange(1, n + 1).reshape((-1,) + (1,) * y.ndim)
+    return 2.0 / n**2 * np.sum((X - y) * (n * (y < X) - i + 0.5), axis=0)
 
-def main(noise=0.005, T_train=6.0, T_test=12.0, K=None, n_pf=500):
+
+def score_prediction(Y, t, truth, T_train):
+    """Score rollouts Y (n x r x K) against the noiseless truth (r x K) separately on the
+    training window [0, T_train] and the extrapolation window (T_train, t[-1]].
+
+    rel_err : ||ensemble median - truth||_F / ||truth||_F on the window
+    cov     : fraction of (component, time) points where truth lies in the 95% band
+    width   : mean width of the 95% band
+    crps    : mean CRPS (proper score, same units as q; lower is better)
+    """
+    lo, med, hi = np.percentile(Y, [2.5, 50, 97.5], axis=0)
+    crps = crps_ensemble(Y, truth)
+    out = dict(err_t = np.linalg.norm(med - truth, axis=0) / np.linalg.norm(truth, axis=0))
+    for name, m in [("train", t <= T_train), ("test", t > T_train)]:
+        if m.any():
+            out[name] = dict(
+                rel_err=np.linalg.norm(med[:, m] - truth[:, m]) / np.linalg.norm(truth[:, m]),
+                cov=np.mean((truth[:, m] >= lo[:, m]) & (truth[:, m] <= hi[:, m])),
+                width=np.mean(hi[:, m] - lo[:, m]),
+                crps=crps[:, m].mean())
+    return out
+
+
+def main(noise=0.005, T_train=6.0, T_test=12.0, K=None, n_pf=500, system="original"):
     """noise   : std of the snapshot noise
        T_train : fit on [0, T_train]
        T_test  : extrapolate and score on (T_train, T_test]
        K       : training snapshots per trajectory; None keeps the default sampling rate
                  (300 snapshots over 6 time units) whatever T_train is
-       n_pf    : number of posterior draws pushed forward through the ROM"""
+       n_pf    : number of posterior draws pushed forward through the ROM (<= 4 x 2000)
+       system  : name of a system in toy_systems.SYSTEMS"""
     K_given = K is not None
     if K is None:
         K = int(round(T_train * 299 / 6.0)) + 1
@@ -463,11 +412,13 @@ def main(noise=0.005, T_train=6.0, T_test=12.0, K=None, n_pf=500):
     here, stem = os.path.split(os.path.splitext(os.path.abspath(__file__))[0])
     out_dir = os.path.join(here, "pdfs", stem + "_pdfs")
     os.makedirs(out_dir, exist_ok=True)
-    tag = (f"noise{noise:g}_Ttrain{T_train:g}_Ttest{T_test:g}" + (f"_K{K}" if K_given else "")
-           + (f"_npf{n_pf}" if n_pf != 500 else ""))
+    tag = (("" if system == "original" else f"{system}_") +
+           f"noise{noise:g}_Ttrain{T_train:g}_Ttest{T_test:g}" + (f"_K{K}" if K_given else "") +
+           f"_n_pf{n_pf}")
     out = lambda name: os.path.join(out_dir, f"{name}_{tag}.pdf")
-    print(f"noise = {noise}, train on [0, {T_train}] with K = {K}, test on ({T_train}, {T_test}]")
-    prob = build_problem(noise=noise, T_train=T_train, K=K, T_test=T_test)
+    print(f"system = {system}, noise = {noise}, train on [0, {T_train}] with K = {K}, "
+          f"test on ({T_train}, {T_test}]")
+    prob = build_problem(noise=noise, T_train=T_train, K=K, T_test=T_test, system=system)
     r_, d = prob["mu"].shape
 
     names = ["c"] + [f"A{k}" for k in range(r)] + [f"H{k}" for k in range(d - 1 - r)]
@@ -530,7 +481,7 @@ def main(noise=0.005, T_train=6.0, T_test=12.0, K=None, n_pf=500):
 
     # prediction skill vs. the noiseless truth, training window vs. extrapolation window
     scores = {lab: score_prediction(Y, t, prob["Q_true"], T_train)
-              for lab, Y in [("analytical", Y_exact), ("NUTS", Y_mcmc)]}
+              for lab, Y in [("analytical", Y_exact), ("MCMC", Y_mcmc)]}
     hdr = (f"\n{'posterior':>10s} | {'window':>6s} | {'rel err':>7s} | {'95% cov':>7s} | "
            f"{'band width':>10s} | {'CRPS':>7s}")
     print(hdr); print("-" * len(hdr))
@@ -544,7 +495,7 @@ def main(noise=0.005, T_train=6.0, T_test=12.0, K=None, n_pf=500):
     fig, axes = plt.subplots(r_, 1, figsize=(8, 2.4 * r_), sharex=True)
     for k in range(r_):
         ax = axes[k]
-        for Y, lab, col in [(Y_exact, "analytical Gaussian", "C0"), (Y_mcmc, "NUTS", "C1")]:
+        for Y, lab, col in [(Y_exact, "analytical Gaussian", "C0"), (Y_mcmc, "MCMC", "C1")]:
             lo, med, hi = np.percentile(Y[:, k], [2.5, 50, 97.5], axis=0)
             ax.fill_between(t, lo, hi, color=col, alpha=0.25, label=f"{lab} 95%")
             ax.plot(t, med, color=col, lw=1)
@@ -582,5 +533,8 @@ if __name__ == "__main__":
                     help="training snapshots per trajectory (default: keep dt = 6/299)")
     ap.add_argument("--n_pf", type=int, default=500,
                     help="posterior draws pushed forward (at most 8000 = 4 chains x 2000)")
+    ap.add_argument("--system", default="original", choices=list(SYSTEMS),
+                    help="true ROM generating the data (defined in toy_systems.py)")
     args = ap.parse_args()
-    main(noise=args.noise, T_train=args.T_train, T_test=args.T_test, K=args.K, n_pf=args.n_pf)
+    main(noise=args.noise, T_train=args.T_train, T_test=args.T_test, K=args.K, n_pf=args.n_pf,
+         system=args.system)

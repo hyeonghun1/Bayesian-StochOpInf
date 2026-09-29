@@ -14,13 +14,25 @@ Priors per row o_i (entries grouped: g=0 -> [c, A], g=1 -> H):
 
 sigma_i: fixed plug-in (as in Guo et al.) or sampled (--learn-sigma).
 
+Data: build_problem() from bayesopinf_mcmc_check.py, with the data-generating system from
+toy_systems.py (--system) and derivatives from local polynomial smoothing ("lpr", default) or
+plain finite differences ("fd") (--deriv).
+
+Note: with a single trajectory D is nearly rank-deficient, and smoothed derivatives make the plug-in
+sigma small. Guo's prior is scaled by sigma^2, so tikhonov then shrinks the unidentified directions
+very hard (narrow, overconfident intervals), while the learned-scale priors (tau ~ HalfCauchy(1)) leave
+them almost free (wide intervals, many unstable rollouts). Compare --regime rich.
+
 Usage:
     python bayesopinf_priors.py                       # scarce data, all priors
     python bayesopinf_priors.py --regime rich
     python bayesopinf_priors.py --priors tikhonov horseshoe --learn-sigma
+    python bayesopinf_priors.py --system limit_cycle --deriv fd
+Figures go to pdfs/bayesopinf_priors_pdfs/.
 """
 
 import argparse
+import os
 import time
 
 import jax
@@ -230,15 +242,20 @@ def main():
                     help="non-centered parametrization for hier_gauss/laplace/student_t")
     ap.add_argument("--horizon", type=float, default=2.0,
                     help="predict to horizon * training T (extrapolation in time)")
+    ap.add_argument("--system", default="original", choices=list(base.SYSTEMS),
+                    help="true ROM generating the data (defined in toy_systems.py)")
+    ap.add_argument("--deriv", default="lpr", choices=["lpr", "fd"],
+                    help="derivative estimates: local polynomial smoothing or finite differences")
     args = ap.parse_args()
     global NONCENTERED
     NONCENTERED = args.noncentered
 
-    prob = base.build_problem(**REGIMES[args.regime])
+    prob = base.build_problem(**REGIMES[args.regime], system=args.system, deriv=args.deriv)
     O_true = prob["O_true"]
     T_train = prob["t"][-1]
     t_pred = np.linspace(0, args.horizon * T_train, 400)
-    print(f"regime = {args.regime}, learn_sigma = {args.learn_sigma}, "
+    print(f"system = {args.system}, regime = {args.regime}, deriv = {args.deriv}, "
+          f"learn_sigma = {args.learn_sigma}, "
           f"prediction horizon = {t_pred[-1]:.1f} (training ends at {T_train:.1f})\n")
 
     results = {}
@@ -257,7 +274,14 @@ def main():
         print(f"{p:>10s} | {s['rel_err']:10.3f} | {s['coverage']:10.2f} | {s['width']:11.3f} | "
               f"{s['zero_abs']:16.3f} | {s['finite']:6.2f} | {s['traj_cov']:12.2f} | {s['band_w']:10.3f}")
 
-    tag = f"{args.regime}{'_learnsigma' if args.learn_sigma else ''}"
+    tag = (("" if args.system == "original" else f"{args.system}_") + args.regime
+           + ("" if args.deriv == "lpr" else f"_{args.deriv}")
+           + ("_learnsigma" if args.learn_sigma else ""))
+    # figures go to pdfs/<this file>_pdfs/, like bayesopinf_mcmc_check.py
+    here, stem = os.path.split(os.path.splitext(os.path.abspath(__file__))[0])
+    out_dir = os.path.join(here, "pdfs", stem + "_pdfs")
+    os.makedirs(out_dir, exist_ok=True)
+    out = lambda name: os.path.join(out_dir, f"{name}_{tag}.pdf")
 
     # --- forest plot: posterior 95% CI of every operator entry, by prior ------
     d = O_true.shape[1]
@@ -276,10 +300,10 @@ def main():
         ax.set_ylabel(f"row {i}")
     axes[-1].set_xticks(np.arange(d), names)
     axes[0].legend(ncol=P + 1, fontsize=8, loc="upper right")
-    fig.suptitle(f"Operator posteriors (95% CI), {args.regime} data")
+    fig.suptitle(f"Operator posteriors (95% CI), {args.system}, {args.regime} data")
     fig.tight_layout()
     # fig.savefig(f"priors_operators_{tag}.png", dpi=300)
-    fig.savefig(f"priors_operators_{tag}.pdf")
+    fig.savefig(out("priors_operators"))
 
     # --- push-forward: prediction bands per prior vs truth -------------------
     fig, axes = plt.subplots(base.r, P, figsize=(3.2 * P, 2.3 * base.r), sharex=True, sharey="row",
@@ -301,8 +325,8 @@ def main():
     fig.suptitle("95% prediction bands (dashed: truth, dotted: end of training data)")
     fig.tight_layout()
     # fig.savefig(f"priors_pushforward_{tag}.png", dpi=300)
-    fig.savefig(f"priors_pushforward_{tag}.pdf")
-    print(f"\nsaved priors_operators_{tag}.{{pdf}}, priors_pushforward_{tag}.{{pdf}}")
+    fig.savefig(out("priors_pushforward"))
+    print(f"\nsaved priors_operators_{tag}.pdf, priors_pushforward_{tag}.pdf in {out_dir}")
 
 
 if __name__ == "__main__":

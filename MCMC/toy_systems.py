@@ -33,9 +33,8 @@ IU, JU = np.triu_indices(r)                        # compact-Kronecker index pai
 COL = {(int(i), int(j)): m for m, (i, j) in enumerate(zip(IU, JU))}   # (i, j) -> column of H
 
 
-# ----------------------------------------------------------------------------
+
 # Shared helpers
-# ----------------------------------------------------------------------------
 def compact_kron(q):
     """Non-redundant quadratic terms q_i q_j, i <= j. Works on (r,) or (r, K)."""
     i, j = np.triu_indices(q.shape[0])
@@ -62,9 +61,8 @@ def H_from_skew(S):
     return H
 
 
-# ----------------------------------------------------------------------------
+
 # Systems
-# ----------------------------------------------------------------------------
 _S_ORIGINAL = [np.array([[0, a, b], [-a, 0, e], [-b, -e, 0]], dtype=float)
                for a, b, e in [(0.6, -0.3, 0.2), (-0.4, 0.5, 0.3), (0.2, 0.1, -0.5)]]
 _ROTATION = np.array([[0, 1.0, 0], [-1.0, 0, 0.5], [0, -0.5, 0]])
