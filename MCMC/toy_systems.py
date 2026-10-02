@@ -19,7 +19,8 @@ Systems (select by name in true_operators):
                   497, 335-363) with relaxation rate 1:
                       x' = s x - w y - x z,   y' = w x + s y - y z,   z' = -z + x^2 + y^2
                   Linearly unstable (A is NOT dissipative), saturated by an energy-preserving H
-                  -> stable limit cycle x^2 + y^2 = z = s, period 2 pi / w. Sustained oscillation.
+                  -> stable limit cycle x^2 + y^2 = z = s (limit cycle of radius sqrt(s)),
+                    period 2 pi / w. Sustained oscillation.
 
 To add a system: write a function returning (c, A, H) and register it in SYSTEMS.
 
@@ -83,6 +84,7 @@ def weak_damping():
     return _damped_rotation([0.05, 0.05, 0.05], c=(0.0, 0.0, 0.0))
 
 
+# def limit_cycle(s=0.1, w=1.0):
 def limit_cycle(s=0.5, w=2.0):
     """Mean-field vortex-shedding model: stable limit cycle of radius sqrt(s), period 2 pi / w."""
     c = np.zeros(r)
@@ -105,9 +107,8 @@ def true_operators(system="original"):
     return SYSTEMS[system]()
 
 
-# ----------------------------------------------------------------------------
+
 # Quick look: structure and sample trajectories of every system
-# ----------------------------------------------------------------------------
 if __name__ == "__main__":
     from scipy.integrate import solve_ivp
     import matplotlib
@@ -134,7 +135,7 @@ if __name__ == "__main__":
             axes[row, k].axvline(6.0, color="0.5", ls=":", lw=0.8)
             axes[row, k].set_title(f"{name}: q{k}", fontsize=9)
     for a in axes[-1]:
-        a.set_xlabel("t  (dotted: default end of training)")
+        a.set_xlabel("time [s]")
     fig.tight_layout()
     fig.savefig("toy_systems_trajectories.pdf")
     print("saved toy_systems_trajectories.pdf")
