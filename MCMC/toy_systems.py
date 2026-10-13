@@ -9,7 +9,7 @@ so the data-generating model is exactly in the model class and the true operator
 
 Systems (select by name in true_operators):
 
-    original      damping + rotation, energy-preserving H. Every trajectory spirals into a stable
+    damped        damping + rotation, energy-preserving H. Every trajectory spirals into a stable
                   fixed point within a few time units.
     weak_damping  same rotation and H, damping 0.05 on every state and c = 0. Slowly decaying
                   oscillations (decay time ~20), so a test window after training still oscillates.
@@ -24,7 +24,8 @@ Systems (select by name in true_operators):
 
 To add a system: write a function returning (c, A, H) and register it in SYSTEMS.
 
-Run `python toy_systems.py` to print each system's structure and plot sample trajectories.
+Run `python toy_systems.py [--T 12]` to print each system's structure and plot sample trajectories
+over [0, T].
 """
 
 import numpy as np
@@ -58,7 +59,10 @@ def H_from_skew(S):
     H = np.zeros((r, len(IU)))
     for m, (i, j) in enumerate(zip(IU, JU)):
         v = S[i][:, j] + S[j][:, i]                    # S_i e_j + S_j e_i
-        H[:, m] = v / 2 if i == j else v               # halved on the diagonal (q_i^2 counted once)
+        if i == j:
+            H[:, m] = v / 2                 # halved on the diagonal (q_i^2 counted once)
+        else:
+            H[:, m] = v       
     return H
 
 
@@ -84,8 +88,9 @@ def weak_damping():
     return _damped_rotation([0.05, 0.05, 0.05], c=(0.0, 0.0, 0.0))
 
 
-# def limit_cycle(s=0.1, w=1.0):
-def limit_cycle(s=0.5, w=2.0):
+# def limit_cycle(s=0.5, w=2.0):
+def limit_cycle(s=0.1, w=1.0):
+# def limit_cycle(s=-1, w=1.0):
     """Mean-field vortex-shedding model: stable limit cycle of radius sqrt(s), period 2 pi / w."""
     c = np.zeros(r)
     A = np.array([[s, -w, 0.0], [w, s, 0.0], [0.0, 0.0, -1.0]])
@@ -97,10 +102,18 @@ def limit_cycle(s=0.5, w=2.0):
     return c, A, H
 
 
-SYSTEMS = {"original": original, "weak_damping": weak_damping, "limit_cycle": limit_cycle}
+SYSTEMS = {"damped": original, "weak_damping": weak_damping, "limit_cycle": limit_cycle}
 
 
-def true_operators(system="original"):
+def system_tag(system):
+    """File-name tag of a system: its name plus the default values of its parameters, e.g.
+    limit_cycle_s-0.1_w1. Read from the current defaults, so editing them changes the file names."""
+    import inspect
+    params = inspect.signature(SYSTEMS[system]).parameters.values()
+    return system + "".join(f"_{q.name}{q.default:g}" for q in params if q.default is not inspect.Parameter.empty)
+
+
+def true_operators(system="damped"):
     """(c, A, H) of the named system."""
     if system not in SYSTEMS:
         raise ValueError(f"unknown system {system!r}; choose from {list(SYSTEMS)}")
@@ -110,32 +123,71 @@ def true_operators(system="original"):
 
 # Quick look: structure and sample trajectories of every system
 if __name__ == "__main__":
+    import os
+    import argparse
     from scipy.integrate import solve_ivp
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    # LaTeX text rendering (Computer Modern); needs a LaTeX installation
+    plt.rcParams.update({"text.usetex": True, "font.family": "serif", "font.serif": ["Computer Modern Roman"]})
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--T_train", type=float, default=6.0, help="training time [0, T_train]")
+    ap.add_argument("--T_test", type=float, default=12.0, help="total simulation time [0, T_test]")
+    args = ap.parse_args()
 
     rng = np.random.default_rng(0)
-    q0s = rng.uniform(-1.5, 1.5, (4, r))               # same kind of ICs as build_problem
-    t = np.linspace(0, 12, 1201)
-    fig, axes = plt.subplots(len(SYSTEMS), r, figsize=(12, 2.4 * len(SYSTEMS)), sharex=True)
-    for row, name in enumerate(SYSTEMS):
+    
+    # random initial conditions for each system, 4 per system
+    q0s = rng.uniform(-1.5, 1.5, (1, r))
+    t = np.linspace(0, args.T_test, int(round(100 * args.T_test)) + 1)   # 100 samples per time unit
+    # rows = states, columns = systems
+    fig, axes = plt.subplots(r, len(SYSTEMS), figsize=(4 * len(SYSTEMS), 2.4 * r), sharex=True, squeeze=False)
+    for col, name in enumerate(SYSTEMS):
         c, A, H = true_operators(name)
         O = operators_to_matrix(c, A, H)
         qs = rng.standard_normal((200, r))
-        ep = max(abs(q @ (H @ compact_kron(q))) for q in qs)
+        
+        # Quadratic energy-preserving: q^T H (q kron q) = 0 for all q if H is energy-preserving
+        # Check: max |q^T H (q kron q)| over random q
+        energy_preserving = max(abs(q @ (H @ compact_kron(q))) for q in qs)
+        
         print(f"{name:>13s}: max eig sym(A) = {np.linalg.eigvalsh(0.5 * (A + A.T)).max():+.3f} "
               f"({'dissipative' if np.linalg.eigvalsh(0.5 * (A + A.T)).max() < 0 else 'NOT dissipative'}), "
-              f"energy-preserving H: {ep < 1e-12}")
+              f"energy-preserving H: {energy_preserving < 1e-12}")
+
+        # the operators of dq/dt = c + A q + H (q kron q)_compact, one row per state
+        hcols = [f"x{i}x{j}" for i, j in zip(IU, JU)]
+        print(f"{'':>6s}{'c':>8s} |" + "".join(f"{f'A[:, {j}]':>8s}" for j in range(r)) + " |"
+              + "".join(f"{h:>8s}" for h in hcols))
+        for i in range(r):
+            print(f"{f'dx{i}/dt':>6s}{c[i]:8.3g} |" + "".join(f"{v:8.3g}" for v in A[i]) + " |"
+                  + "".join(f"{v:8.3g}" for v in H[i]))
+        print()
+
         for q0 in q0s:
             y = solve_ivp(rom_rhs(O), (0, t[-1]), q0, t_eval=t, rtol=1e-10, atol=1e-12).y
             for k in range(r):
-                axes[row, k].plot(t, y[k], lw=1)
+                axes[k, col].plot(t, y[k], lw=1)
         for k in range(r):
-            axes[row, k].axvline(6.0, color="0.5", ls=":", lw=0.8)
-            axes[row, k].set_title(f"{name}: q{k}", fontsize=9)
+            axes[k, col].axvline(args.T_train, color="0.5", ls=":", lw=0.8)
+        axes[0, col].set_title(name.replace("_", " "), fontsize=15)   # a bare "_" is an error in LaTeX
+    for k in range(r):
+        axes[k, 0].set_ylabel(f"$x_{k}$", fontsize=15)
+        for j in range(len(SYSTEMS)):
+            axes[k, j].tick_params(axis="y", labelsize=15)
+        
+    
     for a in axes[-1]:
-        a.set_xlabel("time [s]")
+        a.set_xlabel("time [s]", fontsize=15)
+        a.tick_params(axis="x", labelsize=15)
     fig.tight_layout()
-    fig.savefig("toy_systems_trajectories.pdf")
-    print("saved toy_systems_trajectories.pdf")
+    # figures go to pdfs/<this file>_pdfs/, like the other scripts
+    here, stem = os.path.split(os.path.splitext(os.path.abspath(__file__))[0])
+    out_dir = os.path.join(here, "pdfs", stem + "_pdfs")
+    os.makedirs(out_dir, exist_ok=True)
+    # limit-cycle parameters and T in the name, so runs with other settings do not overwrite each other
+    name = f"toy_systems_trajectories_{system_tag('limit_cycle')}_T{args.T_test:g}.pdf"
+    fig.savefig(os.path.join(out_dir, name))
+    print(f"saved {name} in {out_dir}")
